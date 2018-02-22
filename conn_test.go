@@ -1,7 +1,6 @@
 package pq
 
 import (
-	"context"
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
@@ -29,7 +28,7 @@ func forceBinaryParameters() bool {
 	}
 }
 
-func testConninfo(conninfo string) string {
+func openTestConnConninfo(conninfo string) (*sql.DB, error) {
 	defaultTo := func(envvar string, value string) {
 		if os.Getenv(envvar) == "" {
 			os.Setenv(envvar, value)
@@ -44,11 +43,8 @@ func testConninfo(conninfo string) string {
 		!strings.HasPrefix(conninfo, "postgresql://") {
 		conninfo = conninfo + " binary_parameters=yes"
 	}
-	return conninfo
-}
 
-func openTestConnConninfo(conninfo string) (*sql.DB, error) {
-	return sql.Open("postgres", testConninfo(conninfo))
+	return sql.Open("postgres", conninfo)
 }
 
 func openTestConn(t Fatalistic) *sql.DB {
@@ -140,7 +136,7 @@ func TestOpenURL(t *testing.T) {
 	testURL("postgresql://")
 }
 
-const pgpassFile = "/tmp/pqgotest_pgpass"
+const pgpass_file = "/tmp/pqgotest_pgpass"
 
 func TestPgpass(t *testing.T) {
 	if os.Getenv("TRAVIS") != "true" {
@@ -164,11 +160,11 @@ func TestPgpass(t *testing.T) {
 		rows, err := txn.Query("SELECT USER")
 		if err != nil {
 			txn.Rollback()
+			rows.Close()
 			if expected != "fail" {
 				t.Fatalf(reason, err)
 			}
 		} else {
-			rows.Close()
 			if expected != "ok" {
 				t.Fatalf(reason, err)
 			}
@@ -176,10 +172,10 @@ func TestPgpass(t *testing.T) {
 		txn.Rollback()
 	}
 	testAssert("", "ok", "missing .pgpass, unexpected error %#v")
-	os.Setenv("PGPASSFILE", pgpassFile)
+	os.Setenv("PGPASSFILE", pgpass_file)
 	testAssert("host=/tmp", "fail", ", unexpected error %#v")
-	os.Remove(pgpassFile)
-	pgpass, err := os.OpenFile(pgpassFile, os.O_RDWR|os.O_CREATE, 0644)
+	os.Remove(pgpass_file)
+	pgpass, err := os.OpenFile(pgpass_file, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		t.Fatalf("Unexpected error writing pgpass file %#v", err)
 	}
@@ -195,7 +191,7 @@ localhost:*:*:*:pass_C
 	pgpass.Close()
 
 	assertPassword := func(extra values, expected string) {
-		o := values{
+		o := &values{
 			"host":               "localhost",
 			"sslmode":            "disable",
 			"connect_timeout":    "20",
@@ -207,17 +203,17 @@ localhost:*:*:*:pass_C
 			"datestyle":          "ISO, MDY",
 		}
 		for k, v := range extra {
-			o[k] = v
+			(*o)[k] = v
 		}
-		(&conn{}).handlePgpass(o)
-		if pw := o["password"]; pw != expected {
-			t.Fatalf("For %v expected %s got %s", extra, expected, pw)
+		(&conn{}).handlePgpass(*o)
+		if o.Get("password") != expected {
+			t.Fatalf("For %v expected %s got %s", extra, expected, o.Get("password"))
 		}
 	}
 	// wrong permissions for the pgpass file means it should be ignored
 	assertPassword(values{"host": "example.com", "user": "foo"}, "")
 	// fix the permissions and check if it has taken effect
-	os.Chmod(pgpassFile, 0600)
+	os.Chmod(pgpass_file, 0600)
 	assertPassword(values{"host": "server", "dbname": "some_db", "user": "some_user"}, "pass_A")
 	assertPassword(values{"host": "example.com", "user": "foo"}, "pass_fallback")
 	assertPassword(values{"host": "example.com", "dbname": "some_db", "user": "some_user"}, "pass_B")
@@ -225,7 +221,7 @@ localhost:*:*:*:pass_C
 	assertPassword(values{"host": "", "user": "some_user"}, "pass_C")
 	assertPassword(values{"host": "/tmp", "user": "some_user"}, "pass_C")
 	// cleanup
-	os.Remove(pgpassFile)
+	os.Remove(pgpass_file)
 	os.Setenv("PGPASSFILE", "")
 }
 
@@ -397,8 +393,8 @@ func TestEmptyQuery(t *testing.T) {
 	if _, err := res.RowsAffected(); err != errNoRowsAffected {
 		t.Fatalf("expected %s, got %v", errNoRowsAffected, err)
 	}
-	if _, err := res.LastInsertId(); err != errNoLastInsertID {
-		t.Fatalf("expected %s, got %v", errNoLastInsertID, err)
+	if _, err := res.LastInsertId(); err != errNoLastInsertId {
+		t.Fatalf("expected %s, got %v", errNoLastInsertId, err)
 	}
 	rows, err := db.Query("")
 	if err != nil {
@@ -429,8 +425,8 @@ func TestEmptyQuery(t *testing.T) {
 	if _, err := res.RowsAffected(); err != errNoRowsAffected {
 		t.Fatalf("expected %s, got %v", errNoRowsAffected, err)
 	}
-	if _, err := res.LastInsertId(); err != errNoLastInsertID {
-		t.Fatalf("expected %s, got %v", errNoLastInsertID, err)
+	if _, err := res.LastInsertId(); err != errNoLastInsertId {
+		t.Fatalf("expected %s, got %v", errNoLastInsertId, err)
 	}
 	rows, err = stmt.Query()
 	if err != nil {
@@ -641,57 +637,6 @@ func TestErrorDuringStartup(t *testing.T) {
 	}
 }
 
-type testConn struct {
-	closed bool
-	net.Conn
-}
-
-func (c *testConn) Close() error {
-	c.closed = true
-	return c.Conn.Close()
-}
-
-type testDialer struct {
-	conns []*testConn
-}
-
-func (d *testDialer) Dial(ntw, addr string) (net.Conn, error) {
-	c, err := net.Dial(ntw, addr)
-	if err != nil {
-		return nil, err
-	}
-	tc := &testConn{Conn: c}
-	d.conns = append(d.conns, tc)
-	return tc, nil
-}
-
-func (d *testDialer) DialTimeout(ntw, addr string, timeout time.Duration) (net.Conn, error) {
-	c, err := net.DialTimeout(ntw, addr, timeout)
-	if err != nil {
-		return nil, err
-	}
-	tc := &testConn{Conn: c}
-	d.conns = append(d.conns, tc)
-	return tc, nil
-}
-
-func TestErrorDuringStartupClosesConn(t *testing.T) {
-	// Don't use the normal connection setup, this is intended to
-	// blow up in the startup packet from a non-existent user.
-	var d testDialer
-	c, err := DialOpen(&d, testConninfo("user=thisuserreallydoesntexist"))
-	if err == nil {
-		c.Close()
-		t.Fatal("expected dial error")
-	}
-	if len(d.conns) != 1 {
-		t.Fatalf("got len(d.conns) = %d, want = %d", len(d.conns), 1)
-	}
-	if !d.conns[0].closed {
-		t.Error("connection leaked")
-	}
-}
-
 func TestBadConn(t *testing.T) {
 	var err error
 
@@ -741,28 +686,17 @@ func TestCloseBadConn(t *testing.T) {
 	if err := cn.Close(); err != nil {
 		t.Fatal(err)
 	}
-
-	// During the Go 1.9 cycle, https://github.com/golang/go/commit/3792db5
-	// changed this error from
-	//
-	// net.errClosing = errors.New("use of closed network connection")
-	//
-	// to
-	//
-	// internal/poll.ErrClosing = errors.New("use of closed file or network connection")
-	const errClosing = "use of closed"
-
 	// Verify write after closing fails.
 	if _, err := nc.Write(nil); err == nil {
 		t.Fatal("expected error")
-	} else if !strings.Contains(err.Error(), errClosing) {
-		t.Fatalf("expected %s error, got %s", errClosing, err)
+	} else if !strings.Contains(err.Error(), "use of closed network connection") {
+		t.Fatalf("expected use of closed network connection error, got %s", err)
 	}
 	// Verify second close fails.
 	if err := cn.Close(); err == nil {
 		t.Fatal("expected error")
-	} else if !strings.Contains(err.Error(), errClosing) {
-		t.Fatalf("expected %s error, got %s", errClosing, err)
+	} else if !strings.Contains(err.Error(), "use of closed network connection") {
+		t.Fatalf("expected use of closed network connection error, got %s", err)
 	}
 }
 
@@ -990,14 +924,12 @@ func TestParseErrorInExtendedQuery(t *testing.T) {
 	db := openTestConn(t)
 	defer db.Close()
 
-	_, err := db.Query("PARSE_ERROR $1", 1)
-	pqErr, _ := err.(*Error)
-	// Expecting a syntax error.
-	if err == nil || pqErr == nil || pqErr.Code != "42601" {
-		t.Fatalf("expected syntax error, got %s", err)
+	rows, err := db.Query("PARSE_ERROR $1", 1)
+	if err == nil {
+		t.Fatal("expected error")
 	}
 
-	rows, err := db.Query("SELECT 1")
+	rows, err = db.Query("SELECT 1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1110,16 +1042,16 @@ func TestIssue282(t *testing.T) {
 	db := openTestConn(t)
 	defer db.Close()
 
-	var searchPath string
+	var search_path string
 	err := db.QueryRow(`
 		SET LOCAL search_path TO pg_catalog;
 		SET LOCAL search_path TO pg_catalog;
-		SHOW search_path`).Scan(&searchPath)
+		SHOW search_path`).Scan(&search_path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if searchPath != "pg_catalog" {
-		t.Fatalf("unexpected search_path %s", searchPath)
+	if search_path != "pg_catalog" {
+		t.Fatalf("unexpected search_path %s", search_path)
 	}
 }
 
@@ -1262,11 +1194,16 @@ func TestParseComplete(t *testing.T) {
 	tpc("SELECT foo", "", 0, true) // invalid row count
 }
 
-// Test interface conformance.
-var (
-	_ driver.ExecerContext  = (*conn)(nil)
-	_ driver.QueryerContext = (*conn)(nil)
-)
+func TestExecerInterface(t *testing.T) {
+	// Gin up a straw man private struct just for the type check
+	cn := &conn{c: nil}
+	var cni interface{} = cn
+
+	_, ok := cni.(driver.Execer)
+	if !ok {
+		t.Fatal("Driver doesn't implement Execer")
+	}
+}
 
 func TestNullAfterNonNull(t *testing.T) {
 	db := openTestConn(t)
@@ -1444,29 +1381,36 @@ func TestParseOpts(t *testing.T) {
 }
 
 func TestRuntimeParameters(t *testing.T) {
+	type RuntimeTestResult int
+	const (
+		ResultUnknown RuntimeTestResult = iota
+		ResultSuccess
+		ResultError // other error
+	)
+
 	tests := []struct {
-		conninfo string
-		param    string
-		expected string
-		success  bool
+		conninfo        string
+		param           string
+		expected        string
+		expectedOutcome RuntimeTestResult
 	}{
 		// invalid parameter
-		{"DOESNOTEXIST=foo", "", "", false},
+		{"DOESNOTEXIST=foo", "", "", ResultError},
 		// we can only work with a specific value for these two
-		{"client_encoding=SQL_ASCII", "", "", false},
-		{"datestyle='ISO, YDM'", "", "", false},
+		{"client_encoding=SQL_ASCII", "", "", ResultError},
+		{"datestyle='ISO, YDM'", "", "", ResultError},
 		// "options" should work exactly as it does in libpq
-		{"options='-c search_path=pqgotest'", "search_path", "pqgotest", true},
+		{"options='-c search_path=pqgotest'", "search_path", "pqgotest", ResultSuccess},
 		// pq should override client_encoding in this case
-		{"options='-c client_encoding=SQL_ASCII'", "client_encoding", "UTF8", true},
+		{"options='-c client_encoding=SQL_ASCII'", "client_encoding", "UTF8", ResultSuccess},
 		// allow client_encoding to be set explicitly
-		{"client_encoding=UTF8", "client_encoding", "UTF8", true},
+		{"client_encoding=UTF8", "client_encoding", "UTF8", ResultSuccess},
 		// test a runtime parameter not supported by libpq
-		{"work_mem='139kB'", "work_mem", "139kB", true},
+		{"work_mem='139kB'", "work_mem", "139kB", ResultSuccess},
 		// test fallback_application_name
-		{"application_name=foo fallback_application_name=bar", "application_name", "foo", true},
-		{"application_name='' fallback_application_name=bar", "application_name", "", true},
-		{"fallback_application_name=bar", "application_name", "bar", true},
+		{"application_name=foo fallback_application_name=bar", "application_name", "foo", ResultSuccess},
+		{"application_name='' fallback_application_name=bar", "application_name", "", ResultSuccess},
+		{"fallback_application_name=bar", "application_name", "bar", ResultSuccess},
 	}
 
 	for _, test := range tests {
@@ -1481,23 +1425,23 @@ func TestRuntimeParameters(t *testing.T) {
 			continue
 		}
 
-		tryGetParameterValue := func() (value string, success bool) {
+		tryGetParameterValue := func() (value string, outcome RuntimeTestResult) {
 			defer db.Close()
 			row := db.QueryRow("SELECT current_setting($1)", test.param)
 			err = row.Scan(&value)
 			if err != nil {
-				return "", false
+				return "", ResultError
 			}
-			return value, true
+			return value, ResultSuccess
 		}
 
-		value, success := tryGetParameterValue()
-		if success != test.success && !test.success {
+		value, outcome := tryGetParameterValue()
+		if outcome != test.expectedOutcome && outcome == ResultError {
 			t.Fatalf("%v: unexpected error: %v", test.conninfo, err)
 		}
-		if success != test.success {
+		if outcome != test.expectedOutcome {
 			t.Fatalf("unexpected outcome %v (was expecting %v) for conninfo \"%s\"",
-				success, test.success, test.conninfo)
+				outcome, test.expectedOutcome, test.conninfo)
 		}
 		if value != test.expected {
 			t.Fatalf("bad value for %s: got %s, want %s with conninfo \"%s\"",
@@ -1547,113 +1491,5 @@ func TestQuoteIdentifier(t *testing.T) {
 		if got != test.want {
 			t.Errorf("QuoteIdentifier(%q) = %v want %v", test.input, got, test.want)
 		}
-	}
-}
-
-func TestRowsResultTag(t *testing.T) {
-	type ResultTag interface {
-		Result() driver.Result
-		Tag() string
-	}
-
-	tests := []struct {
-		query string
-		tag   string
-		ra    int64
-	}{
-		{
-			query: "CREATE TEMP TABLE temp (a int)",
-			tag:   "CREATE TABLE",
-		},
-		{
-			query: "INSERT INTO temp VALUES (1), (2)",
-			tag:   "INSERT",
-			ra:    2,
-		},
-		{
-			query: "SELECT 1",
-		},
-		// A SELECT anywhere should take precedent.
-		{
-			query: "SELECT 1; INSERT INTO temp VALUES (1), (2)",
-		},
-		{
-			query: "INSERT INTO temp VALUES (1), (2); SELECT 1",
-		},
-		// Multiple statements that don't return rows should return the last tag.
-		{
-			query: "CREATE TEMP TABLE t (a int); DROP TABLE t",
-			tag:   "DROP TABLE",
-		},
-		// Ensure a rows-returning query in any position among various tags-returing
-		// statements will prefer the rows.
-		{
-			query: "SELECT 1; CREATE TEMP TABLE t (a int); DROP TABLE t",
-		},
-		{
-			query: "CREATE TEMP TABLE t (a int); SELECT 1; DROP TABLE t",
-		},
-		{
-			query: "CREATE TEMP TABLE t (a int); DROP TABLE t; SELECT 1",
-		},
-		// Verify that an no-results query doesn't set the tag.
-		{
-			query: "CREATE TEMP TABLE t (a int); SELECT 1 WHERE FALSE; DROP TABLE t;",
-		},
-	}
-
-	// If this is the only test run, this will correct the connection string.
-	openTestConn(t).Close()
-
-	conn, err := Open("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	q := conn.(driver.QueryerContext)
-
-	for _, test := range tests {
-		if rows, err := q.QueryContext(context.Background(), test.query, nil); err != nil {
-			t.Fatalf("%s: %s", test.query, err)
-		} else {
-			r := rows.(ResultTag)
-			if tag := r.Tag(); tag != test.tag {
-				t.Fatalf("%s: unexpected tag %q", test.query, tag)
-			}
-			res := r.Result()
-			if ra, _ := res.RowsAffected(); ra != test.ra {
-				t.Fatalf("%s: unexpected rows affected: %d", test.query, ra)
-			}
-			rows.Close()
-		}
-	}
-}
-
-// TestQuickClose tests that closing a query early allows a subsequent query to work.
-func TestQuickClose(t *testing.T) {
-	db := openTestConn(t)
-	defer db.Close()
-
-	tx, err := db.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	rows, err := tx.Query("SELECT 1; SELECT 2;")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := rows.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	var id int
-	if err := tx.QueryRow("SELECT 3").Scan(&id); err != nil {
-		t.Fatal(err)
-	}
-	if id != 3 {
-		t.Fatalf("unexpected %d", id)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
 	}
 }
